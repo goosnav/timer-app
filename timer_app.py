@@ -3,11 +3,10 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 import tkinter as tk
 from tkinter import messagebox, ttk
-from tkinter import font as tkfont
 
 try:
     import winsound  # type: ignore
@@ -119,139 +118,30 @@ class CountdownTimer:
         return self._compute_state()
 
 
-class TimeField(ttk.Entry):
-    """Entry-like widget that emulates Google timer digit entry."""
-
-    def __init__(
-        self,
-        master: tk.Widget,
-        *,
-        initial: str = "00:00:00",
-        font: Optional[tkfont.Font] = None,
-        width: int = 10,
-    ) -> None:
-        self._digits = self._normalize(initial)
-        self.variable = tk.StringVar(value=self._format())
-        super().__init__(
-            master,
-            textvariable=self.variable,
-            justify="center",
-            width=width,
-            font=font,
-        )
-        self._callback: Optional[Callable[[], None]] = None
-        self.bind("<KeyPress>", self._on_key)
-        self.bind("<Control-v>", lambda event: "break")
-        self.bind("<Control-V>", lambda event: "break")
-        self.bind("<Button-1>", self._focus_all)
-        self.bind("<FocusIn>", self._focus_all)
-
-    def set_callback(self, callback: Callable[[], None]) -> None:
-        self._callback = callback
-
-    def _focus_all(self, _event: tk.Event) -> None:
-        self.after_idle(lambda: self.select_range(0, tk.END))
-
-    def _notify(self) -> None:
-        if self._callback:
-            self._callback()
-        self.event_generate("<<TimeFieldChanged>>")
-
-    def _normalize(self, value: str) -> str:
-        digits = "".join(ch for ch in value if ch.isdigit())
-        if not digits:
-            digits = "0"
-        digits = digits[-6:]
-        digits = digits.rjust(6, "0")
-        return digits
-
-    def _format(self) -> str:
-        hours = self._digits[0:2]
-        minutes = self._digits[2:4]
-        seconds = self._digits[4:6]
-        return f"{hours}:{minutes}:{seconds}"
-
-    def _set_digits(self, digits: str) -> None:
-        self._digits = digits
-        self.variable.set(self._format())
-        self._notify()
-
-    def _on_key(self, event: tk.Event) -> Optional[str]:
-        if event.keysym in ("Tab", "ISO_Left_Tab", "Shift_L", "Shift_R", "Control_L", "Control_R"):
-            return None
-        if event.keysym == "BackSpace":
-            if self.selection_present():
-                self._set_digits("000000")
-                return "break"
-            new_digits = "0" + self._digits[:-1]
-            self._set_digits(new_digits)
-            return "break"
-        if event.keysym == "Delete":
-            self._set_digits("000000")
-            return "break"
-        if event.char and event.char.isdigit():
-            if self.selection_present():
-                self._digits = "000000"
-            new_digits = (self._digits + event.char)[-6:]
-            self._set_digits(new_digits)
-            return "break"
-        if event.keysym in ("Left", "Right", "Home", "End"):
-            return "break"
-        return "break"
-
-    def set_from_seconds(self, total_seconds: int) -> None:
-        total_seconds = max(0, min(total_seconds, 359999))
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        digits = f"{hours:02d}{minutes:02d}{seconds:02d}"[-6:]
-        self._set_digits(digits)
-
-    def set_from_string(self, value: str) -> None:
-        self._set_digits(self._normalize(value))
-
-    def get_seconds(self) -> int:
-        hours = int(self._digits[0:2])
-        minutes = int(self._digits[2:4])
-        seconds = int(self._digits[4:6])
-        return hours * 3600 + minutes * 60 + seconds
-
-    def get_formatted(self) -> str:
-        return self._format()
-
-
 class CountdownGUI:
     """Tkinter-based GUI for the countdown timer."""
 
-    WINDOW_BG = "#B7B7B7"
-    PANEL_BG = "#D4D0C8"
-    EDGE_DARK = "#808080"
-    EDGE_LIGHT = "#FFFFFF"
-    ACCENT_DARK = "#000080"
-    PROGRESS_BAR = "#003399"
+    STYLE_BG = "#C3CED6"
+    STYLE_DARK = "#7A8AA1"
+    STYLE_LIGHT = "#E5E9F0"
     FONT_FAMILY = "Tahoma"
 
     def __init__(self, master: tk.Tk, timer: CountdownTimer) -> None:
         self.master = master
         self.timer = timer
         self.master.title("Countdown Timer")
-        self.master.configure(bg=self.WINDOW_BG)
-        self.master.geometry("420x260")
-        self.master.minsize(280, 160)
+        self.master.configure(bg=self.STYLE_BG)
+        self.master.geometry("380x220")
+        self.master.minsize(260, 120)
         self.master.attributes("-topmost", True)
 
         self.drag_data = {"x": 0, "y": 0}
         self.compact_mode = tk.BooleanVar(value=False)
+        self.duration_var = tk.StringVar(value="00:05:00")
         self.remaining_var = tk.StringVar(value="00:00:00")
         self.end_time_var = tk.StringVar(value="End Time: --:--:--")
-        self.sound_var = tk.StringVar(value="System Asterisk")
+        self.sound_var = tk.StringVar(value="Classic Beep")
         self._completed = False
-
-        self.font_small = tkfont.Font(family=self.FONT_FAMILY, size=9)
-        self.font_medium = tkfont.Font(family=self.FONT_FAMILY, size=10)
-        self.font_large = tkfont.Font(family=self.FONT_FAMILY, size=18, weight="bold")
-
-        self.duration_field: Optional[TimeField] = None
-        self.add_field: Optional[TimeField] = None
 
         self._load_config()
 
@@ -265,21 +155,14 @@ class CountdownGUI:
         if CONFIG_FILE.exists():
             try:
                 data = json.loads(CONFIG_FILE.read_text())
-                self._initial_duration = data.get("last_duration", "00:05:00")
-                self._initial_add = data.get("add_duration", "00:01:00")
-                self.sound_var.set(data.get("sound", "System Asterisk"))
+                self.duration_var.set(data.get("last_duration", "00:05:00"))
+                self.sound_var.set(data.get("sound", "Classic Beep"))
             except json.JSONDecodeError:
                 CONFIG_FILE.unlink(missing_ok=True)
-                self._initial_duration = "00:05:00"
-                self._initial_add = "00:01:00"
-        else:
-            self._initial_duration = "00:05:00"
-            self._initial_add = "00:01:00"
 
     def _save_config(self) -> None:
         data = {
-            "last_duration": self.duration_field.get_formatted() if self.duration_field else "00:05:00",
-            "add_duration": self.add_field.get_formatted() if self.add_field else "00:01:00",
+            "last_duration": self.duration_var.get(),
             "sound": self.sound_var.get(),
         }
         CONFIG_FILE.write_text(json.dumps(data, indent=2))
@@ -287,205 +170,180 @@ class CountdownGUI:
     def _create_style(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("Timer.TFrame", background=self.PANEL_BG)
         style.configure(
-            "Timer.TButton",
+            "Classic.TFrame",
+            background=self.STYLE_BG,
+            borderwidth=2,
+            relief="groove",
+        )
+        style.configure(
+            "Classic.TLabel",
+            background=self.STYLE_BG,
+            foreground="#1B2A4E",
+            font=(self.FONT_FAMILY, 9),
+        )
+        style.configure(
+            "Classic.TButton",
+            background=self.STYLE_LIGHT,
+            foreground="#1B2A4E",
+            font=(self.FONT_FAMILY, 9),
             padding=4,
-            background=self.PANEL_BG,
-            font=self.font_medium,
-            relief="raised",
         )
         style.map(
-            "Timer.TButton",
-            background=[("active", self.WINDOW_BG)],
+            "Classic.TButton",
+            background=[("active", self.STYLE_DARK)],
+            foreground=[("active", "white")],
         )
         style.configure(
-            "Timer.TCheckbutton",
-            background=self.WINDOW_BG,
-            font=self.font_small,
+            "Classic.TCheckbutton",
+            background=self.STYLE_BG,
+            foreground="#1B2A4E",
+            font=(self.FONT_FAMILY, 9),
         )
         style.configure(
             "Classic.Horizontal.TProgressbar",
-            thickness=16,
-            troughcolor="#E4E0D7",
-            background=self.PROGRESS_BAR,
-            bordercolor=self.EDGE_DARK,
-            lightcolor="#6D90C7",
-            darkcolor=self.ACCENT_DARK,
+            thickness=18,
+            troughcolor="#F2F2F2",
+            background="#4A6FA5",
+            bordercolor="#4A6FA5",
+            lightcolor="#6F8FBF",
+            darkcolor="#2F4A6F",
         )
 
     def _create_widgets(self) -> None:
-        self.outer = tk.Frame(self.master, bg=self.WINDOW_BG, bd=1, relief="flat")
-        self.outer.pack(expand=True, fill="both", padx=6, pady=(6, 4))
+        self.container = ttk.Frame(self.master, style="Classic.TFrame")
+        self.container.pack(expand=True, fill="both", padx=6, pady=6)
 
-        self.display_panel = tk.Frame(
-            self.outer,
-            bg=self.PANEL_BG,
-            bd=2,
-            relief="sunken",
-            highlightthickness=1,
-            highlightbackground=self.EDGE_LIGHT,
-            highlightcolor=self.EDGE_LIGHT,
+        self.container.columnconfigure(0, weight=1)
+        for row in range(4):
+            self.container.rowconfigure(row, weight=1)
+
+        input_frame = ttk.Frame(self.container, style="Classic.TFrame")
+        input_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        input_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            input_frame,
+            text="Duration (HH:MM:SS):",
+            style="Classic.TLabel",
+        ).grid(row=0, column=0, padx=4, pady=4, sticky="w")
+
+        self.duration_entry = ttk.Entry(
+            input_frame,
+            textvariable=self.duration_var,
+            font=(self.FONT_FAMILY, 9),
+            width=12,
         )
-        self.display_panel.pack(expand=True, fill="both", padx=4, pady=(4, 6))
+        self.duration_entry.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
 
-        self.remaining_label = tk.Label(
-            self.display_panel,
-            textvariable=self.remaining_var,
-            font=self.font_large,
-            bg=self.PANEL_BG,
-            fg=self.ACCENT_DARK,
-            anchor="center",
-        )
-        self.remaining_label.pack(expand=True, fill="both", padx=8, pady=(12, 4))
-
-        self.end_time_label = tk.Label(
-            self.display_panel,
-            textvariable=self.end_time_var,
-            font=self.font_small,
-            bg=self.PANEL_BG,
-            fg="#202020",
-            anchor="center",
-        )
-        self.end_time_label.pack(pady=(0, 8))
-
-        self.compact_hint = tk.Label(
-            self.display_panel,
-            text="Compact Mode — double-click to restore",
-            font=self.font_small,
-            bg=self.PANEL_BG,
-            fg="#202020",
-        )
-        self.compact_hint.pack_forget()
-        self.compact_hint.bind("<Double-Button-1>", self._toggle_compact_from_double)
-
-        self.progress = ttk.Progressbar(
-            self.outer,
-            style="Classic.Horizontal.TProgressbar",
-            orient="horizontal",
-            mode="determinate",
-        )
-        self.progress.pack(fill="x", padx=6, pady=(0, 6))
-
-        self.controls_panel = tk.Frame(self.outer, bg=self.WINDOW_BG)
-        self.controls_panel.pack(fill="both", padx=4, pady=(0, 4))
-        self.controls_panel.columnconfigure(0, weight=1)
-        self.controls_panel.columnconfigure(1, weight=1)
-
-        duration_box = tk.Frame(self.controls_panel, bg=self.WINDOW_BG)
-        duration_box.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
-        duration_box.columnconfigure(1, weight=1)
-
-        duration_label = tk.Label(
-            duration_box,
-            text="Duration:",
-            font=self.font_small,
-            bg=self.WINDOW_BG,
-            fg="#000000",
-        )
-        duration_label.grid(row=0, column=0, sticky="w", padx=(0, 4))
-
-        self.duration_field = TimeField(duration_box, initial=self._initial_duration, font=self.font_medium)
-        self.duration_field.grid(row=0, column=1, sticky="ew")
-        self.duration_field.set_callback(self._on_duration_changed)
-
-        add_box = tk.Frame(self.controls_panel, bg=self.WINDOW_BG)
-        add_box.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
-        add_box.columnconfigure(1, weight=1)
-
-        add_label = tk.Label(
-            add_box,
-            text="Add Time:",
-            font=self.font_small,
-            bg=self.WINDOW_BG,
-            fg="#000000",
-        )
-        add_label.grid(row=0, column=0, sticky="w", padx=(0, 4))
-
-        self.add_field = TimeField(add_box, initial=self._initial_add, font=self.font_medium)
-        self.add_field.grid(row=0, column=1, sticky="ew")
-        self.add_field.set_callback(self._on_add_duration_changed)
-
-        buttons_box = tk.Frame(self.controls_panel, bg=self.WINDOW_BG)
-        buttons_box.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=2, pady=2)
-        for col in range(2):
-            buttons_box.columnconfigure(col, weight=1)
+        controls_frame = ttk.Frame(self.container, style="Classic.TFrame")
+        controls_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 4))
+        for col in range(4):
+            controls_frame.columnconfigure(col, weight=1)
 
         self.start_button = ttk.Button(
-            buttons_box,
+            controls_frame,
             text="Start",
-            style="Timer.TButton",
+            style="Classic.TButton",
             command=self.start_timer,
         )
-        self.start_button.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        self.start_button.grid(row=0, column=0, padx=4, pady=4, sticky="nsew")
 
         self.pause_button = ttk.Button(
-            buttons_box,
+            controls_frame,
             text="Pause",
-            style="Timer.TButton",
+            style="Classic.TButton",
             command=self.toggle_pause,
         )
-        self.pause_button.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
+        self.pause_button.grid(row=0, column=1, padx=4, pady=4, sticky="nsew")
 
         self.reset_button = ttk.Button(
-            buttons_box,
+            controls_frame,
             text="Reset",
-            style="Timer.TButton",
+            style="Classic.TButton",
             command=self.reset_timer,
         )
-        self.reset_button.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
+        self.reset_button.grid(row=0, column=2, padx=4, pady=4, sticky="nsew")
 
         self.add_button = ttk.Button(
-            buttons_box,
-            text="Add",
-            style="Timer.TButton",
+            controls_frame,
+            text="Add +00:00:00",
+            style="Classic.TButton",
             command=self.add_time,
         )
-        self.add_button.grid(row=1, column=1, sticky="nsew", padx=2, pady=2)
+        self.add_button.grid(row=0, column=3, padx=4, pady=4, sticky="nsew")
 
-        sound_box = tk.Frame(self.outer, bg=self.WINDOW_BG)
-        sound_box.pack(fill="x", padx=4, pady=(0, 4))
-        sound_box.columnconfigure(1, weight=1)
+        info_frame = ttk.Frame(self.container, style="Classic.TFrame")
+        info_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
+        info_frame.columnconfigure(0, weight=1)
 
-        sound_label = tk.Label(
-            sound_box,
-            text="Alarm Sound:",
-            font=self.font_small,
-            bg=self.WINDOW_BG,
-            fg="#000000",
+        self.remaining_label = ttk.Label(
+            info_frame,
+            textvariable=self.remaining_var,
+            style="Classic.TLabel",
+            font=(self.FONT_FAMILY, 11, "bold"),
         )
-        sound_label.grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self.remaining_label.grid(row=0, column=0, padx=4, pady=2, sticky="w")
+
+        self.end_time_label = ttk.Label(
+            info_frame,
+            textvariable=self.end_time_var,
+            style="Classic.TLabel",
+        )
+        self.end_time_label.grid(row=1, column=0, padx=4, pady=2, sticky="w")
+
+        sound_frame = ttk.Frame(self.container, style="Classic.TFrame")
+        sound_frame.grid(row=3, column=0, sticky="nsew")
+        sound_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            sound_frame,
+            text="Alarm Sound:",
+            style="Classic.TLabel",
+        ).grid(row=0, column=0, padx=4, pady=4, sticky="w")
 
         sound_choices = [
-            "System Asterisk",
-            "System Exclamation",
-            "System Hand",
-            "System Question",
-            "Classic Beeps",
+            "Classic Beep",
+            "Double Beep",
+            "Triple Beep",
+            "Soft Bell",
         ]
         self.sound_menu = ttk.OptionMenu(
-            sound_box,
+            sound_frame,
             self.sound_var,
             self.sound_var.get(),
             *sound_choices,
             command=self._on_sound_change,
         )
-        self.sound_menu.configure(width=16)
-        self.sound_menu.grid(row=0, column=1, sticky="ew")
+        self.sound_menu.configure(width=12)
+        self.sound_menu.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
 
         self.compact_check = ttk.Checkbutton(
-            sound_box,
+            sound_frame,
             text="Compact View",
             variable=self.compact_mode,
             command=self.toggle_compact,
-            style="Timer.TCheckbutton",
+            style="Classic.TCheckbutton",
         )
-        self.compact_check.grid(row=0, column=2, sticky="e", padx=(6, 0))
+        self.compact_check.grid(row=0, column=2, padx=4, pady=4, sticky="e")
 
-        self.sound_box = sound_box
-        self._on_duration_changed()
-        self.timer.set_duration(self.duration_field.get_seconds())
-        self._on_resize()
+        self.progress = ttk.Progressbar(
+            self.master,
+            style="Classic.Horizontal.TProgressbar",
+            orient="horizontal",
+            mode="determinate",
+        )
+        self.progress.pack(fill="x", padx=10, pady=(0, 8))
+
+        self.compact_remaining_label = ttk.Label(
+            self.master,
+            textvariable=self.remaining_var,
+            style="Classic.TLabel",
+            anchor="center",
+        )
+
+        self.duration_var.trace_add("write", lambda *_: self._update_add_label())
+        self._update_add_label()
 
     def _create_tray_icon(self) -> None:
         if not pystray or not Image:
@@ -495,11 +353,10 @@ class CountdownGUI:
 
         # Create a simple Windows 2000-style icon (blue square with white border)
         size = 64
-        image = Image.new("RGB", (size, size), self.ACCENT_DARK)
+        image = Image.new("RGB", (size, size), self.STYLE_DARK)
         draw = ImageDraw.Draw(image)
-        draw.rectangle((6, 6, size - 7, size - 7), outline=self.EDGE_LIGHT, fill=self.PANEL_BG)
-        draw.rectangle((7, 7, size - 8, size - 8), outline=self.EDGE_DARK)
-        draw.text((20, 18), "T", fill=self.ACCENT_DARK)
+        draw.rectangle((8, 8, size - 9, size - 9), outline="white", fill=self.STYLE_BG)
+        draw.text((16, 20), "T", fill=self.STYLE_DARK)
         self.tray_icon = pystray.Icon(
             "countdown_timer",
             image,
@@ -516,12 +373,9 @@ class CountdownGUI:
     def _bind_events(self) -> None:
         self.master.bind("<space>", lambda event: self.toggle_pause())
         self.master.bind("<Escape>", lambda event: self.reset_timer())
-        self.master.bind("<Configure>", self._on_resize)
+        self.master.bind("<Configure>", lambda event: self._update_progress_geometry())
         self.master.bind("<ButtonPress-1>", self._start_move)
         self.master.bind("<B1-Motion>", self._on_move)
-        self.remaining_label.bind("<Double-Button-1>", self._toggle_compact_from_double)
-        self.progress.bind("<Double-Button-1>", self._toggle_compact_from_double)
-        self.display_panel.bind("<Double-Button-1>", self._toggle_compact_from_double)
         if self.tray_icon:
             self.master.protocol("WM_DELETE_WINDOW", self._hide_window)
         else:
@@ -567,55 +421,43 @@ class CountdownGUI:
         if self.timer.has_finished():
             self._handle_completion()
 
-        self._update_progress_padding()
+        self._update_progress_geometry()
         self._schedule_update()
 
     def _handle_completion(self) -> None:
         if getattr(self, "_completed", False):
             return
         self._completed = True
-        self._play_alarm()
-        self.master.after(150, lambda: messagebox.showinfo("Timer Complete", "Time is up!"))
+        threading.Thread(target=self._play_alarm, daemon=True).start()
+        messagebox.showinfo("Timer Complete", "Time is up!")
         self.pause_button.configure(text="Pause")
 
     def _play_alarm(self) -> None:
         sound = self.sound_var.get()
+        pattern = {
+            "Classic Beep": [(440, 300)],
+            "Double Beep": [(523, 200), (659, 200)],
+            "Triple Beep": [(659, 150), (784, 150), (880, 200)],
+            "Soft Bell": [(392, 400), (330, 400)],
+        }.get(sound, [(440, 300)])
+
         if winsound:
-            alias_map = {
-                "System Asterisk": "SystemAsterisk",
-                "System Exclamation": "SystemExclamation",
-                "System Hand": "SystemHand",
-                "System Question": "SystemQuestion",
-            }
-            alias = alias_map.get(sound)
-            if alias:
-                winsound.PlaySound(alias, winsound.SND_ALIAS | winsound.SND_ASYNC)
-                return
-            winsound.PlaySound(None, winsound.SND_PURGE)
-            threading.Thread(target=self._play_fallback_beeps, daemon=True).start()
+            for freq, dur in pattern:
+                winsound.Beep(freq, dur)
+                time.sleep(0.05)
         else:
-            threading.Thread(target=self._play_fallback_beeps, daemon=True).start()
-
-    def _play_fallback_beeps(self) -> None:
-        pattern = [440, 523, 659, 523]
-        for freq in pattern:
-            if winsound:
-                winsound.Beep(freq, 200)
-            else:
-                self.master.after(0, self.master.bell)
+            for _freq, _dur in pattern:
+                self.master.bell()
                 time.sleep(0.2)
-            time.sleep(0.05)
 
-    def _update_progress_padding(self) -> None:
+    def _update_progress_geometry(self) -> None:
         if self.compact_mode.get():
             self.progress.pack_configure(fill="x", padx=6, pady=6)
         else:
-            self.progress.pack_configure(fill="x", padx=6, pady=(0, 6))
+            self.progress.pack_configure(fill="x", padx=10, pady=(0, 8))
 
     def start_timer(self) -> None:
-        if not self.duration_field:
-            return
-        duration = self.duration_field.get_seconds()
+        duration = self._parse_duration(self.duration_var.get())
         if duration <= 0:
             messagebox.showwarning("Invalid Duration", "Please enter a positive duration.")
             return
@@ -642,55 +484,51 @@ class CountdownGUI:
     def reset_timer(self) -> None:
         self.timer.reset()
         self.pause_button.configure(text="Pause")
-        if self.duration_field:
-            self.remaining_var.set(self.duration_field.get_formatted())
+        self.remaining_var.set(self.duration_var.get())
         self.end_time_var.set("End Time: --:--:--")
         self.progress.configure(value=0)
         self._completed = False
-        if winsound:
-            winsound.PlaySound(None, winsound.SND_PURGE)
 
     def add_time(self) -> None:
-        if not self.add_field:
-            return
-        seconds = self.add_field.get_seconds()
+        seconds = self._parse_duration(self.duration_var.get())
         if seconds <= 0:
             messagebox.showwarning("Invalid Duration", "Please enter a duration to add.")
             return
-        if self.timer.start_time:
-            self.timer.add_time(seconds)
-        else:
-            if self.duration_field:
-                new_total = self.duration_field.get_seconds() + seconds
-                self.duration_field.set_from_seconds(new_total)
-                self.remaining_var.set(self.duration_field.get_formatted())
-                self.timer.set_duration(new_total)
+        self.timer.add_time(seconds)
         self._save_config()
         self._completed = False
 
     def toggle_compact(self) -> None:
-        self._apply_compact_mode()
-
-    def _toggle_compact_from_double(self, _event: Optional[tk.Event] = None) -> None:
-        self.compact_mode.set(not self.compact_mode.get())
-        self._apply_compact_mode()
-
-    def _apply_compact_mode(self) -> None:
         compact = self.compact_mode.get()
+        self.container.pack_forget()
+        self.compact_remaining_label.pack_forget()
         if compact:
-            self.controls_panel.pack_forget()
-            self.sound_box.pack_forget()
-            self.end_time_label.pack_forget()
-            self.compact_hint.pack(pady=(0, 8))
+            self.progress.pack_configure(fill="x", padx=6, pady=6)
+            self.compact_remaining_label.pack(fill="x", padx=6)
         else:
-            self.compact_hint.pack_forget()
-            if not self.end_time_label.winfo_manager():
-                self.end_time_label.pack(pady=(0, 8))
-            if not self.controls_panel.winfo_manager():
-                self.controls_panel.pack(fill="both", padx=4, pady=(0, 4))
-            if not self.sound_box.winfo_manager():
-                self.sound_box.pack(fill="x", padx=4, pady=(0, 4))
-        self._update_progress_padding()
+            self.container.pack(expand=True, fill="both", padx=6, pady=6)
+            self.progress.pack_configure(fill="x", padx=10, pady=(0, 8))
+        self._update_compact_visibility()
+
+    def _update_compact_visibility(self) -> None:
+        visible = not self.compact_mode.get()
+        for child in self.container.winfo_children():
+            child.grid_remove() if not visible else child.grid()
+        if visible:
+            self.container.grid_propagate(True)
+        else:
+            self.container.update()
+
+    def _parse_duration(self, value: str) -> int:
+        try:
+            parts = value.strip().split(":")
+            if len(parts) != 3:
+                raise ValueError
+            hours, minutes, seconds = map(int, parts)
+            total_seconds = hours * 3600 + minutes * 60 + seconds
+            return max(0, total_seconds)
+        except ValueError:
+            return 0
 
     def _format_timedelta(self, delta: timedelta) -> str:
         total_seconds = int(max(delta.total_seconds(), 0))
@@ -698,28 +536,13 @@ class CountdownGUI:
         minutes, seconds = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-    def _on_duration_changed(self) -> None:
-        if not self.duration_field:
-            return
-        formatted = self.duration_field.get_formatted()
+    def _update_add_label(self) -> None:
+        self.add_button.configure(text=f"Add +{self.duration_var.get()}")
         if not self.timer.start_time:
-            self.remaining_var.set(formatted)
-        self._save_config()
-
-    def _on_add_duration_changed(self) -> None:
-        self._save_config()
+            self.remaining_var.set(self.duration_var.get())
 
     def _on_sound_change(self, *_args) -> None:
         self._save_config()
-
-    def _on_resize(self, _event: Optional[tk.Event] = None) -> None:
-        width = max(self.master.winfo_width(), 280)
-        height = max(self.master.winfo_height(), 160)
-        base = max(8, min(width // 26, height // 14))
-        self.font_small.configure(size=base)
-        self.font_medium.configure(size=base + 1)
-        self.font_large.configure(size=max(14, (base + 2) * 2))
-        self._update_progress_padding()
 
     def run(self) -> None:
         self.master.mainloop()
