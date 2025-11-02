@@ -1,7 +1,7 @@
 import json
 import math
+import struct
 import threading
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -236,24 +236,107 @@ class TimeInput(tk.Entry):
     def set_font(self, font: tkfont.Font) -> None:
         self.configure(font=font)
 
+class RetroProgressBar(tk.Canvas):
+    """Canvas-based progress bar with Windows 2000 styling."""
+
+    def __init__(
+        self,
+        master: tk.Widget,
+        *,
+        trough: str,
+        fill: str,
+        highlight: str,
+        shadow: str,
+        stripe: str,
+        text_dark: str,
+        text_light: str,
+        font: tkfont.Font,
+        height: int = 24,
+    ) -> None:
+        super().__init__(
+            master,
+            height=height,
+            bg=trough,
+            bd=2,
+            relief="sunken",
+            highlightthickness=0,
+        )
+        self._fraction = 0.0
+        self._label = "0% Complete"
+        self._font = font
+        self._fill = fill
+        self._highlight = highlight
+        self._shadow = shadow
+        self._stripe = stripe
+        self._text_dark = text_dark
+        self._text_light = text_light
+        self.bind("<Configure>", self._redraw)
+
+    def set_progress(self, fraction: float, label: Optional[str] = None) -> None:
+        self._fraction = max(0.0, min(1.0, fraction))
+        if label is not None:
+            self._label = label
+        self._redraw()
+
+    def set_font(self, font: tkfont.Font) -> None:
+        self._font = font
+        self._redraw()
+
+    def _redraw(self, _event: Optional[tk.Event] = None) -> None:
+        self.delete("all")
+        width = max(self.winfo_width(), 1)
+        height = max(self.winfo_height(), 1)
+        fill_width = int(width * self._fraction)
+
+        if fill_width > 0:
+            self.create_rectangle(0, 0, fill_width, height, fill=self._fill, outline=self._shadow)
+            # Add stripes to mimic the Windows 2000 progress bar
+            for x in range(-fill_width, fill_width, 12):
+                stripe_x = x + (fill_width % 12)
+                if stripe_x < fill_width:
+                    self.create_rectangle(
+                        stripe_x,
+                        0,
+                        min(stripe_x + 6, fill_width),
+                        height,
+                        fill=self._stripe,
+                        outline="",
+                    )
+
+        self.create_line(0, 0, width, 0, fill=self._highlight)
+        self.create_line(0, 0, 0, height, fill=self._highlight)
+        self.create_line(0, height - 1, width, height - 1, fill=self._shadow)
+        self.create_line(width - 1, 0, width - 1, height, fill=self._shadow)
+
+        text_color = self._text_light if fill_width > width * 0.45 else self._text_dark
+        self.create_text(
+            width / 2,
+            height / 2,
+            text=self._label,
+            fill=text_color,
+            font=self._font,
+        )
+
+
 class CountdownGUI:
     """Tkinter-based GUI styled after a Windows 2000 utility."""
 
     WINDOW_BG = "#C0C0C0"
     PANEL_BG = "#D4D0C8"
     EDGE_LIGHT = "#FFFFFF"
-    EDGE_DARK = "#7F7F7F"
-    ACCENT = "#003399"
+    EDGE_DARK = "#404040"
+    ACCENT = "#0A246A"
+    ACCENT_LIGHT = "#3A6EA5"
     TEXT_DARK = "#000000"
     TEXT_SOFT = "#202020"
     FONT_FAMILY = "Tahoma"
     SAMPLE_RATE = 44100
 
-    SOUND_PATTERNS = {
-        "Classic Alarm": [(880, 220), (784, 220), (988, 320), (0, 80)] * 2,
-        "Soft Chime": [(523, 260), (659, 260), (784, 420)],
-        "Digital Sweep": [(440, 140), (660, 140), (880, 220), (660, 140), (440, 140)],
-        "Radar Ping": [(1200, 120), (0, 80), (900, 220), (0, 120), (1200, 180)],
+    SOUND_PRESETS = {
+        "Office Reminder": [((1046, 784), 220), ((), 90), ((1046, 784), 220), ((880,), 320)],
+        "Meeting Alert": [((659, 988), 180), ((), 70), ((784, 1046), 220), ((659,), 260), ((988,), 320)],
+        "Soft Pulse": [((523,), 180), ((), 60), ((659,), 180), ((), 60), ((784,), 280), ((), 80), ((523, 784), 220)],
+        "Digital Sweep": [((440,), 140), ((554,), 140), ((659,), 140), ((880,), 220), ((1108,), 260)],
     }
 
     def __init__(self, master: tk.Tk, timer: CountdownTimer) -> None:
@@ -268,14 +351,15 @@ class CountdownGUI:
         self.drag_offset = {"x": 0, "y": 0}
         self.compact_mode = tk.BooleanVar(value=False)
         self.remaining_var = tk.StringVar(value="00:00:00")
+        self.compact_remaining_var = tk.StringVar(value="Time Left: 00:00:00")
         self.end_time_var = tk.StringVar(value="End Time: --:--:--")
         self.sound_var = tk.StringVar()
         self._completed = False
-        self._audio_cache: dict[str, bytes] = {}
+        self._audio_cache: dict[tuple, dict[str, bytes]] = {}
 
-        self._config_data = {"last_duration": "00:05:00", "sound": "Classic Alarm"}
+        self._config_data = {"last_duration": "00:05:00", "sound": "Office Reminder"}
         self._load_config()
-        self.sound_var.set(self._config_data.get("sound", "Classic Alarm"))
+        self.sound_var.set(self._config_data.get("sound", "Office Reminder"))
 
         self._setup_fonts()
         self._create_style()
@@ -290,8 +374,11 @@ class CountdownGUI:
             "small": tkfont.Font(family=self.FONT_FAMILY, size=9),
             "normal": tkfont.Font(family=self.FONT_FAMILY, size=10),
             "input": tkfont.Font(family=self.FONT_FAMILY, size=11),
-            "timer": tkfont.Font(family=self.FONT_FAMILY, size=26, weight="bold"),
-            "compact": tkfont.Font(family=self.FONT_FAMILY, size=14, weight="bold"),
+            "timer": tkfont.Font(family=self.FONT_FAMILY, size=28, weight="bold"),
+            "end": tkfont.Font(family=self.FONT_FAMILY, size=14, weight="bold"),
+            "progress": tkfont.Font(family=self.FONT_FAMILY, size=11, weight="bold"),
+            "compact": tkfont.Font(family=self.FONT_FAMILY, size=16, weight="bold"),
+            "compact_info": tkfont.Font(family=self.FONT_FAMILY, size=11),
         }
 
     def _load_config(self) -> None:
@@ -353,15 +440,6 @@ class CountdownGUI:
             font=self.fonts["normal"],
         )
         self.style.configure(
-            "Win2000.Horizontal.TProgressbar",
-            thickness=16,
-            troughcolor="#E5E1DA",
-            bordercolor=self.EDGE_DARK,
-            lightcolor=self.EDGE_LIGHT,
-            darkcolor=self.ACCENT,
-            background=self.ACCENT,
-        )
-        self.style.configure(
             "Win2000.TCombobox",
             fieldbackground="#FFFFFF",
             selectforeground=self.TEXT_DARK,
@@ -380,9 +458,21 @@ class CountdownGUI:
         inner = tk.Frame(raised, bg=self.WINDOW_BG, bd=2, relief="sunken")
         inner.pack(expand=True, fill="both", padx=2, pady=2)
 
-        # Timer display panel
+        banner = tk.Frame(inner, bg=self.ACCENT, height=38, bd=0, relief="flat")
+        banner.pack(fill="x", padx=6, pady=(6, 0))
+        banner.columnconfigure(0, weight=1)
+        tk.Label(
+            banner,
+            text="Countdown Timer",
+            font=self.fonts["end"],
+            foreground="#FFFFFF",
+            background=self.ACCENT,
+            anchor="w",
+            padx=12,
+        ).grid(row=0, column=0, sticky="ew")
+
         self.timer_panel = tk.Frame(inner, bg=self.PANEL_BG, bd=2, relief="sunken")
-        self.timer_panel.pack(expand=True, fill="both", padx=10, pady=(10, 6))
+        self.timer_panel.pack(expand=True, fill="both", padx=10, pady=(8, 6))
 
         self.remaining_label = tk.Label(
             self.timer_panel,
@@ -391,25 +481,31 @@ class CountdownGUI:
             background=self.PANEL_BG,
             foreground=self.TEXT_DARK,
         )
-        self.remaining_label.pack(expand=True, fill="both", pady=(8, 4))
+        self.remaining_label.pack(expand=True, fill="both", pady=(12, 8))
 
         self.end_time_label = tk.Label(
             self.timer_panel,
             textvariable=self.end_time_var,
-            font=self.fonts["small"],
+            font=self.fonts["end"],
             background=self.PANEL_BG,
-            foreground=self.TEXT_SOFT,
+            foreground=self.ACCENT,
         )
-        self.end_time_label.pack(pady=(0, 8))
+        self.end_time_label.pack(pady=(0, 10))
 
-        # Progress bar for full view
-        self.progress = ttk.Progressbar(
+        self.progress = RetroProgressBar(
             inner,
-            orient="horizontal",
-            mode="determinate",
-            style="Win2000.Horizontal.TProgressbar",
+            trough="#E9E5DD",
+            fill=self.ACCENT,
+            highlight=self.EDGE_LIGHT,
+            shadow=self.EDGE_DARK,
+            stripe=self.ACCENT_LIGHT,
+            text_dark=self.TEXT_DARK,
+            text_light="#FFFFFF",
+            font=self.fonts["progress"],
+            height=28,
         )
-        self.progress.pack(fill="x", padx=12, pady=(0, 10))
+        self.progress.pack(fill="x", padx=12, pady=(0, 12))
+        self.progress.set_progress(0.0, "0% Complete")
 
         self.controls_panel = tk.Frame(inner, bg=self.WINDOW_BG)
         self.controls_panel.pack(fill="both", expand=False, padx=8, pady=(0, 10))
@@ -491,7 +587,7 @@ class CountdownGUI:
         self.sound_combo = ttk.Combobox(
             sound_frame,
             textvariable=self.sound_var,
-            values=list(self.SOUND_PATTERNS.keys()),
+            values=list(self.SOUND_PRESETS.keys()),
             state="readonly",
             style="Win2000.TCombobox",
         )
@@ -514,22 +610,39 @@ class CountdownGUI:
         self.compact_view = tk.Frame(self.master, bg=self.WINDOW_BG, bd=2, relief="ridge")
         self.compact_view.pack_forget()
 
-        self.compact_progress = ttk.Progressbar(
+        self.compact_progress = RetroProgressBar(
             self.compact_view,
-            orient="horizontal",
-            mode="determinate",
-            style="Win2000.Horizontal.TProgressbar",
+            trough="#E9E5DD",
+            fill=self.ACCENT,
+            highlight=self.EDGE_LIGHT,
+            shadow=self.EDGE_DARK,
+            stripe=self.ACCENT_LIGHT,
+            text_dark=self.TEXT_DARK,
+            text_light="#FFFFFF",
+            font=self.fonts["progress"],
+            height=26,
         )
-        self.compact_progress.pack(fill="x", padx=12, pady=(8, 4))
+        self.compact_progress.pack(fill="x", padx=10, pady=(10, 6))
+        self.compact_progress.set_progress(0.0, "0% Complete")
 
         self.compact_time = tk.Label(
             self.compact_view,
-            textvariable=self.remaining_var,
+            textvariable=self.compact_remaining_var,
             font=self.fonts["compact"],
             background=self.WINDOW_BG,
             foreground=self.TEXT_DARK,
         )
-        self.compact_time.pack(fill="x", padx=12)
+        self.compact_time.pack(fill="x", padx=10)
+
+        self.compact_end_var = tk.StringVar(value="Ends @ --:--:--")
+        self.compact_end = tk.Label(
+            self.compact_view,
+            textvariable=self.compact_end_var,
+            font=self.fonts["compact_info"],
+            background=self.WINDOW_BG,
+            foreground=self.TEXT_SOFT,
+        )
+        self.compact_end.pack(fill="x", padx=10, pady=(2, 4))
 
         self.expand_button = ttk.Button(
             self.compact_view,
@@ -626,14 +739,21 @@ class CountdownGUI:
 
         formatted = self._format_timedelta(remaining)
         self.remaining_var.set(formatted)
+        self.compact_remaining_var.set(f"Time Left: {formatted}")
         if self.timer.start_time:
-            self.end_time_var.set(f"End Time: {end.strftime('%H:%M:%S')}")
+            end_text = end.strftime("%H:%M:%S")
+            self.end_time_var.set(f"End Time: {end_text}")
+            if hasattr(self, "compact_end_var"):
+                self.compact_end_var.set(f"Ends @ {end_text}")
         else:
             self.end_time_var.set("End Time: --:--:--")
+            if hasattr(self, "compact_end_var"):
+                self.compact_end_var.set("Ends @ --:--:--")
 
-        progress_value = state["progress"] * 100
-        self.progress.configure(value=progress_value, maximum=100)
-        self.compact_progress.configure(value=progress_value, maximum=100)
+        progress_fraction = state["progress"]
+        progress_label = f"{int(progress_fraction * 100):3d}% Complete"
+        self.progress.set_progress(progress_fraction, progress_label)
+        self.compact_progress.set_progress(progress_fraction, progress_label)
 
         if self.timer.has_finished():
             self._handle_completion()
@@ -646,7 +766,8 @@ class CountdownGUI:
         self._completed = True
         self.pause_button.configure(text="Pause")
         self._play_alarm()
-        self.master.after(150, self._show_completion_popup)
+        # Delay popup slightly so the alarm is heard first
+        self.master.after(800, self._show_completion_popup)
 
     def _show_completion_popup(self) -> None:
         if self.master.state() == "withdrawn":
@@ -655,51 +776,88 @@ class CountdownGUI:
 
     def _play_alarm(self) -> None:
         sound_name = self.sound_var.get()
-        pattern = self.SOUND_PATTERNS.get(sound_name, self.SOUND_PATTERNS["Classic Alarm"])
-        if winsound:
-            threading.Thread(target=self._play_winsound, args=(pattern,), daemon=True).start()
+        pattern = self.SOUND_PRESETS.get(sound_name) or next(iter(self.SOUND_PRESETS.values()))
+        buffers = self._get_sound_buffers(pattern)
+
+        used_audio_device = False
+        if winsound and hasattr(winsound, "PlaySound"):
+            threading.Thread(
+                target=self._play_winsound_wave,
+                args=(buffers["wave"],),
+                daemon=True,
+            ).start()
+            used_audio_device = True
         elif sa:
-            audio = self._get_or_build_wave(pattern)
-            sa.play_buffer(audio, 1, 2, self.SAMPLE_RATE)
+            threading.Thread(
+                target=sa.play_buffer,
+                args=(buffers["pcm"], 1, 2, self.SAMPLE_RATE),
+                daemon=True,
+            ).start()
+            used_audio_device = True
         else:
             self._play_fallback(pattern)
 
-    def _play_winsound(self, pattern: list[tuple[int, int]]) -> None:
-        for freq, dur in pattern:
-            if freq <= 0:
-                time.sleep(dur / 1000.0)
-            else:
-                winsound.Beep(freq, max(dur, 50))
-                time.sleep(0.02)
+        if not used_audio_device:
+            try:
+                self.master.bell()
+            except tk.TclError:
+                pass
 
-    def _play_fallback(self, pattern: list[tuple[int, int]]) -> None:
+    def _play_winsound_wave(self, data: bytes) -> None:
+        try:
+            winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
+        except RuntimeError:
+            pass
+
+    def _play_fallback(self, pattern: list[tuple[tuple[int, ...], int]]) -> None:
         def step(index: int = 0) -> None:
             if index >= len(pattern):
                 return
-            freq, dur = pattern[index]
-            if freq > 0:
-                self.master.bell()
-            self.master.after(max(int(dur * 1.1), 80), lambda: step(index + 1))
+            freqs, dur = pattern[index]
+            if freqs:
+                try:
+                    self.master.bell()
+                except tk.TclError:
+                    return
+            self.master.after(max(int(dur * 1.05), 80), lambda: step(index + 1))
 
-        self.master.after(0, step)
+        self.master.after(120, step)
 
-    def _get_or_build_wave(self, pattern: list[tuple[int, int]]) -> bytes:
-        key = tuple(pattern)
-        if key in self._audio_cache:
-            return self._audio_cache[key]
+    def _get_sound_buffers(self, pattern: list[tuple[tuple[int, ...], int]]) -> dict[str, bytes]:
+        key = tuple((tuple(freqs), dur) for freqs, dur in pattern)
+        cached = self._audio_cache.get(key)
+        if cached:
+            return cached
 
         frames = bytearray()
-        for freq, dur in pattern:
+        for freqs, dur in pattern:
             samples = max(int(self.SAMPLE_RATE * (dur / 1000.0)), 1)
-            if freq <= 0:
+            if not freqs:
                 frames.extend((0).to_bytes(2, "little", signed=True) * samples)
                 continue
             for n in range(samples):
+                t = n / self.SAMPLE_RATE
                 envelope = 0.5 - 0.5 * math.cos(min(n / samples, 1.0) * math.pi)
-                value = int(32767 * envelope * math.sin(2 * math.pi * freq * (n / self.SAMPLE_RATE)))
+                sample = 0.0
+                for freq in freqs:
+                    sample += math.sin(2 * math.pi * freq * t)
+                sample /= len(freqs)
+                value = int(32767 * envelope * sample * 0.85)
                 frames.extend(int(value).to_bytes(2, "little", signed=True))
-        self._audio_cache[key] = bytes(frames)
-        return self._audio_cache[key]
+
+        pcm = bytes(frames)
+        wave_data = self._wrap_wave(pcm)
+        cached = {"pcm": pcm, "wave": wave_data}
+        self._audio_cache[key] = cached
+        return cached
+
+    def _wrap_wave(self, pcm: bytes) -> bytes:
+        data_size = len(pcm)
+        riff_size = data_size + 36
+        header = b"RIFF" + struct.pack("<I", riff_size) + b"WAVE"
+        fmt_chunk = b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, self.SAMPLE_RATE, self.SAMPLE_RATE * 2, 2, 16)
+        data_chunk = b"data" + struct.pack("<I", data_size)
+        return header + fmt_chunk + data_chunk + pcm
 
     def _on_configure(self, event: tk.Event) -> None:
         if event.widget is self.master:
@@ -709,20 +867,32 @@ class CountdownGUI:
         scale = min(max(width / 460, 0.75), max(height / 310, 0.75))
         normal_size = max(9, int(10 * scale))
         input_size = max(10, int(12 * scale))
-        timer_size = max(22, int(28 * scale))
-        compact_size = max(12, int(16 * scale))
+        timer_size = max(24, int(30 * scale))
+        end_size = max(12, int(15 * scale))
+        progress_size = max(10, int(12 * scale))
+        compact_size = max(12, int(18 * scale))
+        compact_info_size = max(10, int(12 * scale))
 
         self.fonts["small"].configure(size=max(8, normal_size - 1))
         self.fonts["normal"].configure(size=normal_size)
         self.fonts["input"].configure(size=input_size)
         self.fonts["timer"].configure(size=timer_size)
+        self.fonts["end"].configure(size=end_size)
+        self.fonts["progress"].configure(size=progress_size)
         self.fonts["compact"].configure(size=compact_size)
+        self.fonts["compact_info"].configure(size=compact_info_size)
 
         self.duration_input.set_font(self.fonts["input"])
         self.add_input.set_font(self.fonts["input"])
         self.remaining_label.configure(font=self.fonts["timer"])
         self.compact_time.configure(font=self.fonts["compact"])
-        self.end_time_label.configure(font=self.fonts["small"])
+        self.end_time_label.configure(font=self.fonts["end"])
+        if hasattr(self, "compact_end"):
+            self.compact_end.configure(font=self.fonts["compact_info"])
+        if hasattr(self, "progress"):
+            self.progress.set_font(self.fonts["progress"])
+        if hasattr(self, "compact_progress"):
+            self.compact_progress.set_font(self.fonts["progress"])
         self.style.configure("Win2000.TLabel", font=self.fonts["normal"])
         self.style.configure("Win2000.TButton", font=self.fonts["normal"])
         self.style.configure("Win2000.TCheckbutton", font=self.fonts["normal"])
@@ -757,9 +927,17 @@ class CountdownGUI:
         self.timer.reset()
         self.pause_button.configure(text="Pause")
         self.remaining_var.set(self.duration_input.get_formatted())
+        self.compact_remaining_var.set(f"Time Left: {self.duration_input.get_formatted()}")
         self.end_time_var.set("End Time: --:--:--")
-        self.progress.configure(value=0)
-        self.compact_progress.configure(value=0)
+        if hasattr(self, "compact_end_var"):
+            self.compact_end_var.set("Ends @ --:--:--")
+        self.progress.set_progress(0.0, "0% Complete")
+        self.compact_progress.set_progress(0.0, "0% Complete")
+        if winsound:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except RuntimeError:
+                pass
         self._completed = False
 
     def add_time(self) -> None:
@@ -793,7 +971,9 @@ class CountdownGUI:
 
     def _on_duration_change(self) -> None:
         if not self.timer.start_time:
-            self.remaining_var.set(self.duration_input.get_formatted())
+            formatted = self.duration_input.get_formatted()
+            self.remaining_var.set(formatted)
+            self.compact_remaining_var.set(f"Time Left: {formatted}")
         self._save_config()
 
     def _on_sound_change(self, *_event) -> None:
