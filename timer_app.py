@@ -1,13 +1,12 @@
 import json
 import math
 import struct
-import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 try:
@@ -356,8 +355,16 @@ class CountdownGUI:
         self.sound_var = tk.StringVar()
         self._completed = False
         self._audio_cache: dict[tuple, dict[str, bytes]] = {}
+        self._custom_sounds: dict[str, Path] = {}
+        self._play_obj: Optional["sa.PlayObject"] = None if sa else None
+        self._last_sound_dir = Path.home()
 
-        self._config_data = {"last_duration": "00:05:00", "sound": "Office Reminder"}
+        self._config_data = {
+            "last_duration": "00:05:00",
+            "sound": "Office Reminder",
+            "custom_sounds": {},
+            "last_sound_dir": str(self._last_sound_dir),
+        }
         self._load_config()
         self.sound_var.set(self._config_data.get("sound", "Office Reminder"))
 
@@ -389,8 +396,17 @@ class CountdownGUI:
                     {
                         "last_duration": data.get("last_duration", self._config_data["last_duration"]),
                         "sound": data.get("sound", self._config_data["sound"]),
+                        "custom_sounds": data.get("custom_sounds", {}),
+                        "last_sound_dir": data.get("last_sound_dir", self._config_data["last_sound_dir"]),
                     }
                 )
+                for name, path_str in self._config_data.get("custom_sounds", {}).items():
+                    path = Path(path_str)
+                    if path.exists():
+                        self._custom_sounds[name] = path
+                last_dir = Path(self._config_data.get("last_sound_dir", str(self._last_sound_dir)))
+                if last_dir.exists():
+                    self._last_sound_dir = last_dir
             except json.JSONDecodeError:
                 CONFIG_FILE.unlink(missing_ok=True)
 
@@ -398,6 +414,8 @@ class CountdownGUI:
         payload = {
             "last_duration": self.duration_input.get_formatted(),
             "sound": self.sound_var.get(),
+            "custom_sounds": {name: str(path) for name, path in self._custom_sounds.items()},
+            "last_sound_dir": str(self._last_sound_dir),
         }
         CONFIG_FILE.write_text(json.dumps(payload, indent=2))
 
@@ -587,12 +605,20 @@ class CountdownGUI:
         self.sound_combo = ttk.Combobox(
             sound_frame,
             textvariable=self.sound_var,
-            values=list(self.SOUND_PRESETS.keys()),
+            values=self._get_sound_options(),
             state="readonly",
             style="Win2000.TCombobox",
         )
         self.sound_combo.grid(row=0, column=1, sticky="ew", padx=6)
         self.sound_combo.bind("<<ComboboxSelected>>", self._on_sound_change)
+
+        self.browse_button = ttk.Button(
+            sound_frame,
+            text="Browse...",
+            style="Win2000.TButton",
+            command=self._browse_for_sound,
+        )
+        self.browse_button.grid(row=0, column=2, padx=(0, 6))
 
         self.compact_check = ttk.Checkbutton(
             sound_frame,
@@ -601,10 +627,14 @@ class CountdownGUI:
             command=self.toggle_compact,
             style="Win2000.TCheckbutton",
         )
-        self.compact_check.grid(row=0, column=2, sticky="e")
+        self.compact_check.grid(row=0, column=3, sticky="e")
 
         # Ensure the initial remaining display matches duration
         self.remaining_var.set(self.duration_input.get_formatted())
+
+        if self.sound_var.get() not in self._get_sound_options():
+            first_option = self._get_sound_options()[0]
+            self.sound_var.set(first_option)
 
     def _build_compact_view(self) -> None:
         self.compact_view = tk.Frame(self.master, bg=self.WINDOW_BG, bd=2, relief="ridge")
@@ -766,48 +796,58 @@ class CountdownGUI:
         self._completed = True
         self.pause_button.configure(text="Pause")
         self._play_alarm()
-        # Delay popup slightly so the alarm is heard first
-        self.master.after(800, self._show_completion_popup)
-
-    def _show_completion_popup(self) -> None:
-        if self.master.state() == "withdrawn":
-            self._show_window()
-        messagebox.showinfo("Timer Complete", "Time is up!")
 
     def _play_alarm(self) -> None:
+        self._stop_playback()
         sound_name = self.sound_var.get()
+        if sound_name in self._custom_sounds:
+            self._play_custom_sound(self._custom_sounds[sound_name])
+            return
+
         pattern = self.SOUND_PRESETS.get(sound_name) or next(iter(self.SOUND_PRESETS.values()))
         buffers = self._get_sound_buffers(pattern)
 
-        used_audio_device = False
         if winsound and hasattr(winsound, "PlaySound"):
-            threading.Thread(
-                target=self._play_winsound_wave,
-                args=(buffers["wave"],),
-                daemon=True,
-            ).start()
-            used_audio_device = True
-        elif sa:
-            threading.Thread(
-                target=sa.play_buffer,
-                args=(buffers["pcm"], 1, 2, self.SAMPLE_RATE),
-                daemon=True,
-            ).start()
-            used_audio_device = True
-        else:
-            self._play_fallback(pattern)
-
-        if not used_audio_device:
             try:
-                self.master.bell()
-            except tk.TclError:
+                winsound.PlaySound(buffers["wave"], winsound.SND_MEMORY | winsound.SND_ASYNC)
+                return
+            except RuntimeError:
                 pass
 
-    def _play_winsound_wave(self, data: bytes) -> None:
-        try:
-            winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
-        except RuntimeError:
-            pass
+        if sa:
+            try:
+                self._play_obj = sa.play_buffer(buffers["pcm"], 1, 2, self.SAMPLE_RATE)
+                return
+            except Exception:
+                self._play_obj = None
+
+        self._play_fallback(pattern)
+
+    def _play_custom_sound(self, path: Path) -> None:
+        if not path.exists():
+            print(f"Selected sound file not found: {path}")
+            fallback = next(iter(self.SOUND_PRESETS.values()))
+            self._play_fallback(fallback)
+            return
+
+        if winsound and hasattr(winsound, "PlaySound"):
+            try:
+                winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+                return
+            except RuntimeError:
+                pass
+
+        if sa:
+            try:
+                wave_obj = sa.WaveObject.from_wave_file(str(path))
+                self._play_obj = wave_obj.play()
+                return
+            except Exception as exc:  # pragma: no cover - depends on file support
+                print(f"Unable to play sound file {path}: {exc}")
+                self._play_obj = None
+
+        fallback = next(iter(self.SOUND_PRESETS.values()))
+        self._play_fallback(fallback)
 
     def _play_fallback(self, pattern: list[tuple[tuple[int, ...], int]]) -> None:
         def step(index: int = 0) -> None:
@@ -907,6 +947,7 @@ class CountdownGUI:
         self.timer.start()
         self._completed = False
         self.pause_button.configure(text="Pause")
+        self._stop_playback()
         self._save_config()
 
     def toggle_pause(self) -> None:
@@ -933,11 +974,7 @@ class CountdownGUI:
             self.compact_end_var.set("Ends @ --:--:--")
         self.progress.set_progress(0.0, "0% Complete")
         self.compact_progress.set_progress(0.0, "0% Complete")
-        if winsound:
-            try:
-                winsound.PlaySound(None, winsound.SND_PURGE)
-            except RuntimeError:
-                pass
+        self._stop_playback()
         self._completed = False
 
     def add_time(self) -> None:
@@ -978,6 +1015,49 @@ class CountdownGUI:
 
     def _on_sound_change(self, *_event) -> None:
         self._save_config()
+
+    def _get_sound_options(self) -> list[str]:
+        return list(self.SOUND_PRESETS.keys()) + list(self._custom_sounds.keys())
+
+    def _browse_for_sound(self) -> None:
+        file_path = filedialog.askopenfilename(
+            parent=self.master,
+            title="Select Alarm Sound",
+            initialdir=str(self._last_sound_dir),
+            filetypes=[("Wave files", "*.wav"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+
+        path = Path(file_path)
+        if path.parent.exists():
+            self._last_sound_dir = path.parent
+
+        name = path.stem or str(path)
+        base_name = name
+        counter = 1
+        while name in self.SOUND_PRESETS or name in self._custom_sounds:
+            counter += 1
+            name = f"{base_name} ({counter})"
+
+        self._custom_sounds[name] = path
+        self.sound_combo.configure(values=self._get_sound_options())
+        self.sound_var.set(name)
+        self._save_config()
+
+    def _stop_playback(self) -> None:
+        if sa and self._play_obj is not None:
+            try:
+                self._play_obj.stop()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            finally:
+                self._play_obj = None
+        if winsound:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except RuntimeError:
+                pass
 
     def _format_timedelta(self, delta: timedelta) -> str:
         total_seconds = int(max(delta.total_seconds(), 0))
