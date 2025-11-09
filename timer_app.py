@@ -1,5 +1,6 @@
 import json
 import math
+import shutil
 import struct
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -8,11 +9,6 @@ from typing import Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
-
-try:
-    import winsound  # type: ignore
-except ImportError:  # pragma: no cover - platform specific
-    winsound = None
 
 try:
     import pystray
@@ -369,8 +365,8 @@ class CountdownGUI:
         self.timer = timer
         self.master.title("Countdown Timer")
         self.master.configure(bg=self.EDGE_DARK)
-        self.master.geometry("520x360")
-        self.master.minsize(380, 260)
+        self.master.geometry("560x420")
+        self.master.minsize(520, 360)
         self.master.attributes("-topmost", True)
 
         self.drag_offset = {"x": 0, "y": 0}
@@ -381,22 +377,27 @@ class CountdownGUI:
         self.sound_var = tk.StringVar()
         self._completed = False
         self._audio_cache: dict[tuple, dict[str, bytes]] = {}
+        self._sound_library: dict[str, Path] = {}
         self._custom_sounds: dict[str, Path] = {}
+        self._built_in_names: list[str] = []
+        self._path_lookup: dict[str, str] = {}
+        self._pending_custom_sounds: dict[str, str] = {}
         self._play_obj: Optional["sa.PlayObject"] = None if sa else None
         self._mixer_initialized = False
-        self._using_mixer_music = False
+        self._mixer_channel: Optional["mixer.Channel"] = None if mixer else None
+        self._active_sound: Optional["mixer.Sound"] = None if mixer else None
         self.default_sound_dir = Path(__file__).with_name("sounds")
         self.default_sound_dir.mkdir(parents=True, exist_ok=True)
-        self._last_sound_dir = self.default_sound_dir
 
         self._config_data = {
             "last_duration": "00:05:00",
             "sound": "Office Reminder",
             "custom_sounds": {},
-            "last_sound_dir": str(self._last_sound_dir),
         }
         self._load_config()
-        self._load_default_sounds()
+        self._ensure_builtin_audio()
+        self._restore_custom_sounds_from_config()
+        self._load_directory_sounds()
         self.sound_var.set(self._config_data.get("sound", "Office Reminder"))
 
         self._setup_fonts()
@@ -428,17 +429,9 @@ class CountdownGUI:
                         "last_duration": data.get("last_duration", self._config_data["last_duration"]),
                         "sound": data.get("sound", self._config_data["sound"]),
                         "custom_sounds": data.get("custom_sounds", {}),
-                        "last_sound_dir": data.get("last_sound_dir", self._config_data["last_sound_dir"]),
                     }
                 )
-                for name, path_str in self._config_data.get("custom_sounds", {}).items():
-                    path = Path(path_str)
-                    self._register_custom_sound(name, path)
-                last_dir = Path(self._config_data.get("last_sound_dir", str(self._last_sound_dir)))
-                if last_dir.exists():
-                    self._last_sound_dir = last_dir
-                else:
-                    self._last_sound_dir = self.default_sound_dir
+                self._pending_custom_sounds = dict(self._config_data.get("custom_sounds", {}))
             except json.JSONDecodeError:
                 CONFIG_FILE.unlink(missing_ok=True)
 
@@ -446,12 +439,37 @@ class CountdownGUI:
         payload = {
             "last_duration": self.duration_input.get_formatted(),
             "sound": self.sound_var.get(),
-            "custom_sounds": {name: str(path) for name, path in self._custom_sounds.items()},
-            "last_sound_dir": str(self._last_sound_dir),
+            "custom_sounds": {
+                name: self._serialise_sound_path(path) for name, path in self._custom_sounds.items() if path.exists()
+            },
         }
         CONFIG_FILE.write_text(json.dumps(payload, indent=2))
 
-    def _load_default_sounds(self) -> None:
+    def _serialise_sound_path(self, path: Path) -> str:
+        try:
+            relative = path.resolve().relative_to(self.default_sound_dir.resolve())
+            return str(relative)
+        except Exception:
+            return str(path)
+
+    def _ensure_builtin_audio(self) -> None:
+        for name, pattern in self.SOUND_PRESETS.items():
+            path = self._sound_file_for_name(name)
+            if not path.exists():
+                buffers = self._get_sound_buffers(pattern)
+                path.write_bytes(buffers["wave"])
+            self._register_sound(name, path, built_in=True)
+
+    def _restore_custom_sounds_from_config(self) -> None:
+        pending = dict(self._pending_custom_sounds)
+        self._pending_custom_sounds.clear()
+        for name, stored_path in pending.items():
+            path = Path(stored_path)
+            if not path.is_absolute():
+                path = self.default_sound_dir / path
+            self._register_custom_sound(name, path)
+
+    def _load_directory_sounds(self) -> None:
         if not self.default_sound_dir.exists():
             return
         for path in sorted(self.default_sound_dir.iterdir()):
@@ -462,19 +480,81 @@ class CountdownGUI:
         return path.suffix.lower() in self.AUDIO_EXTENSIONS and path.is_file()
 
     def _register_custom_sound(self, name: str, path: Path) -> Optional[str]:
-        if not path.exists() or not self._is_supported_audio_file(path):
+        if not path.exists():
             return None
+        if not self._is_supported_audio_file(path):
+            return None
+        if not self._is_within_sound_dir(path):
+            try:
+                path = self._import_sound_file(path)
+            except FileNotFoundError:
+                return None
+        registered = self._register_sound(name or path.stem, path, built_in=False)
+        return registered
 
-        base_name = name or path.stem or str(path)
+    def _register_sound(self, name: str, path: Path, *, built_in: bool) -> Optional[str]:
+        if not path.exists():
+            return None
+        if not self._is_supported_audio_file(path):
+            return None
+        try:
+            resolved = str(path.resolve())
+        except Exception:
+            resolved = str(path)
+        existing = self._path_lookup.get(resolved)
+        if existing:
+            if built_in and existing not in self._built_in_names:
+                self._built_in_names.append(existing)
+            elif not built_in and existing not in self._built_in_names and existing not in self._custom_sounds:
+                self._custom_sounds[existing] = path
+            return existing
+
+        base_name = name.strip() or path.stem
         candidate = base_name
-        counter = 1
-        while candidate in self.SOUND_PRESETS or candidate in self._custom_sounds:
-            if self._custom_sounds.get(candidate) == path:
-                return candidate
-            counter += 1
+        counter = 2
+        while candidate in self._sound_library:
             candidate = f"{base_name} ({counter})"
-        self._custom_sounds[candidate] = path
+            counter += 1
+
+        self._sound_library[candidate] = path
+        self._path_lookup[resolved] = candidate
+        if built_in and candidate not in self._built_in_names:
+            self._built_in_names.append(candidate)
+        else:
+            self._custom_sounds[candidate] = path
         return candidate
+
+    def _sound_file_for_name(self, name: str) -> Path:
+        slug = self._slugify_name(name)
+        return self.default_sound_dir / f"{slug}.wav"
+
+    def _slugify_name(self, name: str) -> str:
+        filtered = [c.lower() if c.isalnum() else "-" for c in name.strip()]
+        slug = "".join(filtered).strip("-")
+        while "--" in slug:
+            slug = slug.replace("--", "-")
+        return slug or "sound"
+
+    def _is_within_sound_dir(self, path: Path) -> bool:
+        try:
+            return path.resolve().is_relative_to(self.default_sound_dir.resolve())
+        except AttributeError:
+            resolved_path = path.resolve()
+            base = self.default_sound_dir.resolve()
+            return str(resolved_path).startswith(str(base))
+        except FileNotFoundError:
+            return False
+
+    def _import_sound_file(self, source: Path) -> Path:
+        if not source.exists():
+            raise FileNotFoundError(source)
+        destination = self.default_sound_dir / source.name
+        counter = 2
+        while destination.exists():
+            destination = self.default_sound_dir / f"{source.stem} ({counter}){source.suffix}"
+            counter += 1
+        shutil.copy2(source, destination)
+        return destination
 
     def _create_style(self) -> None:
         self.style = ttk.Style()
@@ -858,79 +938,45 @@ class CountdownGUI:
     def _play_alarm(self) -> None:
         self._stop_playback()
         sound_name = self.sound_var.get()
-        if sound_name in self._custom_sounds:
-            self._play_custom_sound(self._custom_sounds[sound_name])
-            return
+        path = self._sound_library.get(sound_name)
+        if not path or not path.exists():
+            fallback_name = self._built_in_names[0] if self._built_in_names else None
+            if fallback_name:
+                fallback_path = self._sound_library.get(fallback_name)
+                if fallback_path and fallback_path.exists():
+                    path = fallback_path
+                    self.sound_var.set(fallback_name)
+        if path:
+            self._play_sound_file(path)
 
-        pattern = self.SOUND_PRESETS.get(sound_name) or next(iter(self.SOUND_PRESETS.values()))
-        buffers = self._get_sound_buffers(pattern)
-
-        if winsound and hasattr(winsound, "PlaySound"):
-            try:
-                winsound.PlaySound(buffers["wave"], winsound.SND_MEMORY | winsound.SND_ASYNC)
-                return
-            except RuntimeError:
-                pass
-
-        if sa:
-            try:
-                self._play_obj = sa.play_buffer(buffers["pcm"], 1, 2, self.SAMPLE_RATE)
-                return
-            except Exception:
-                self._play_obj = None
-
-        self._play_fallback(pattern)
-
-    def _play_custom_sound(self, path: Path) -> None:
+    def _play_sound_file(self, path: Path) -> None:
         if not path.exists():
             print(f"Selected sound file not found: {path}")
-            fallback = next(iter(self.SOUND_PRESETS.values()))
-            self._play_fallback(fallback)
             return
 
         if self._ensure_mixer():
             try:
                 self._play_obj = None
-                mixer.music.load(str(path))
-                mixer.music.play(loops=0)
-                self._using_mixer_music = True
-                return
+                self._active_sound = mixer.Sound(str(path))
+                channel = self._active_sound.play(loops=0)
+                if channel is not None:
+                    self._mixer_channel = channel
+                    return
             except Exception as exc:  # pragma: no cover - platform specific
-                print(f"Unable to play sound file {path}: {exc}")
-                self._using_mixer_music = False
+                print(f"Unable to play sound file via mixer {path}: {exc}")
+                self._active_sound = None
+                self._mixer_channel = None
 
-        if winsound and hasattr(winsound, "PlaySound"):
-            try:
-                winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
-                return
-            except RuntimeError:
-                pass
-
-        if sa:
+        if path.suffix.lower() == ".wav" and sa:
             try:
                 wave_obj = sa.WaveObject.from_wave_file(str(path))
                 self._play_obj = wave_obj.play()
                 return
             except Exception as exc:  # pragma: no cover - depends on file support
-                print(f"Unable to play sound file {path}: {exc}")
+                print(f"Unable to play sound file via simpleaudio {path}: {exc}")
                 self._play_obj = None
 
-        fallback = next(iter(self.SOUND_PRESETS.values()))
-        self._play_fallback(fallback)
-
-    def _play_fallback(self, pattern: list[tuple[tuple[int, ...], int]]) -> None:
-        def step(index: int = 0) -> None:
-            if index >= len(pattern):
-                return
-            freqs, dur = pattern[index]
-            if freqs:
-                try:
-                    self.master.bell()
-                except tk.TclError:
-                    return
-            self.master.after(max(int(dur * 1.05), 80), lambda: step(index + 1))
-
-        self.master.after(120, step)
+        print(f"Unable to play sound file: {path}")
 
     def _get_sound_buffers(self, pattern: list[tuple[tuple[int, ...], int]]) -> dict[str, bytes]:
         key = tuple((tuple(freqs), dur) for freqs, dur in pattern)
@@ -1086,22 +1132,19 @@ class CountdownGUI:
         self._save_config()
 
     def _get_sound_options(self) -> list[str]:
-        return list(self.SOUND_PRESETS.keys()) + list(self._custom_sounds.keys())
+        return list(self._sound_library.keys())
 
     def _browse_for_sound(self) -> None:
         file_path = filedialog.askopenfilename(
             parent=self.master,
             title="Select Alarm Sound",
-            initialdir=str(self._last_sound_dir),
+            initialdir=str(self.default_sound_dir),
             filetypes=self.AUDIO_FILE_TYPES,
         )
         if not file_path:
             return
 
         path = Path(file_path)
-        if path.parent.exists():
-            self._last_sound_dir = path.parent
-
         name = self._register_custom_sound(path.stem, path)
         if not name:
             messagebox.showerror("Unsupported File", "Please choose a supported audio file.")
@@ -1112,18 +1155,15 @@ class CountdownGUI:
         self._save_config()
 
     def _stop_playback(self) -> None:
-        if self._using_mixer_music and mixer:
+        if mixer and self._mixer_channel is not None:
             try:
                 if mixer.get_init():
-                    mixer.music.stop()
-                    try:
-                        mixer.music.unload()
-                    except Exception:  # pragma: no cover - optional
-                        pass
+                    self._mixer_channel.stop()
             except Exception:  # pragma: no cover - defensive
                 pass
             finally:
-                self._using_mixer_music = False
+                self._mixer_channel = None
+                self._active_sound = None
         if sa and self._play_obj is not None:
             try:
                 self._play_obj.stop()
@@ -1131,18 +1171,15 @@ class CountdownGUI:
                 pass
             finally:
                 self._play_obj = None
-        if winsound:
-            try:
-                winsound.PlaySound(None, winsound.SND_PURGE)
-            except RuntimeError:
-                pass
 
     def _ensure_mixer(self) -> bool:
         if not mixer:
             return False
-        if not self._mixer_initialized:
+        if not self._mixer_initialized or not mixer.get_init():
             try:
-                mixer.init()  # pragma: no cover - system audio
+                mixer.init(frequency=self.SAMPLE_RATE, size=-16, channels=2)  # pragma: no cover - system audio
+                if mixer.get_num_channels() < 4:
+                    mixer.set_num_channels(4)
                 self._mixer_initialized = True
             except Exception as exc:  # pragma: no cover - platform dependent
                 print(f"Unable to initialise audio playback: {exc}")
