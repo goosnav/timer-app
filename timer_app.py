@@ -1,7 +1,9 @@
 import json
 import math
+import platform
 import shutil
 import struct
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -383,9 +385,8 @@ class CountdownGUI:
         self._path_lookup: dict[str, str] = {}
         self._pending_custom_sounds: dict[str, str] = {}
         self._play_obj: Optional["sa.PlayObject"] = None if sa else None
+        self._external_proc: Optional[subprocess.Popen] = None
         self._mixer_initialized = False
-        self._mixer_channel: Optional["mixer.Channel"] = None if mixer else None
-        self._active_sound: Optional["mixer.Sound"] = None if mixer else None
         self.default_sound_dir = Path(__file__).with_name("sounds")
         self.default_sound_dir.mkdir(parents=True, exist_ok=True)
 
@@ -954,29 +955,77 @@ class CountdownGUI:
             print(f"Selected sound file not found: {path}")
             return
 
-        if self._ensure_mixer():
-            try:
-                self._play_obj = None
-                self._active_sound = mixer.Sound(str(path))
-                channel = self._active_sound.play(loops=0)
-                if channel is not None:
-                    self._mixer_channel = channel
-                    return
-            except Exception as exc:  # pragma: no cover - platform specific
-                print(f"Unable to play sound file via mixer {path}: {exc}")
-                self._active_sound = None
-                self._mixer_channel = None
-
-        if path.suffix.lower() == ".wav" and sa:
-            try:
-                wave_obj = sa.WaveObject.from_wave_file(str(path))
-                self._play_obj = wave_obj.play()
-                return
-            except Exception as exc:  # pragma: no cover - depends on file support
-                print(f"Unable to play sound file via simpleaudio {path}: {exc}")
-                self._play_obj = None
+        if self._play_with_mixer(path):
+            return
+        if path.suffix.lower() == ".wav" and self._play_with_simpleaudio(path):
+            return
+        if self._play_with_system_player(path):
+            return
 
         print(f"Unable to play sound file: {path}")
+
+    def _play_with_mixer(self, path: Path) -> bool:
+        if not self._ensure_mixer():
+            return False
+        try:
+            self._play_obj = None
+            self._external_proc = None
+            mixer.music.stop()
+            try:
+                unload = getattr(mixer.music, "unload", None)
+                if callable(unload):
+                    unload()
+            except Exception:  # pragma: no cover - optional API
+                pass
+            mixer.music.load(str(path))
+            mixer.music.play(loops=0)
+            return True
+        except Exception as exc:  # pragma: no cover - platform specific
+            print(f"Unable to play sound file via mixer {path}: {exc}")
+            return False
+
+    def _play_with_simpleaudio(self, path: Path) -> bool:
+        if not sa:
+            return False
+        try:
+            wave_obj = sa.WaveObject.from_wave_file(str(path))
+            self._play_obj = wave_obj.play()
+            self._external_proc = None
+            return True
+        except Exception as exc:  # pragma: no cover - depends on file support
+            print(f"Unable to play sound file via simpleaudio {path}: {exc}")
+            self._play_obj = None
+            return False
+
+    def _play_with_system_player(self, path: Path) -> bool:
+        system = platform.system().lower()
+        commands: list[list[str]] = []
+        if system == "darwin":
+            commands.append(["afplay", str(path)])
+        elif system == "linux":
+            commands.extend(
+                [
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", str(path)],
+                    ["aplay", str(path)],
+                    ["paplay", str(path)],
+                ]
+            )
+
+        for cmd in commands:
+            if shutil.which(cmd[0]) is None:
+                continue
+            try:
+                self._play_obj = None
+                self._external_proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return True
+            except Exception as exc:  # pragma: no cover - platform toolchain
+                print(f"Unable to play sound file via {cmd[0]} {path}: {exc}")
+                self._external_proc = None
+        return False
 
     def _get_sound_buffers(self, pattern: list[tuple[tuple[int, ...], int]]) -> dict[str, bytes]:
         key = tuple((tuple(freqs), dur) for freqs, dur in pattern)
@@ -1155,15 +1204,17 @@ class CountdownGUI:
         self._save_config()
 
     def _stop_playback(self) -> None:
-        if mixer and self._mixer_channel is not None:
+        if mixer and mixer.get_init():
             try:
-                if mixer.get_init():
-                    self._mixer_channel.stop()
+                mixer.music.stop()
             except Exception:  # pragma: no cover - defensive
                 pass
-            finally:
-                self._mixer_channel = None
-                self._active_sound = None
+            try:
+                unload = getattr(mixer.music, "unload", None)
+                if callable(unload):
+                    unload()
+            except Exception:  # pragma: no cover - optional API
+                pass
         if sa and self._play_obj is not None:
             try:
                 self._play_obj.stop()
@@ -1171,15 +1222,25 @@ class CountdownGUI:
                 pass
             finally:
                 self._play_obj = None
+        if self._external_proc is not None:
+            try:
+                if self._external_proc.poll() is None:
+                    self._external_proc.terminate()
+                    try:
+                        self._external_proc.wait(timeout=1)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+            except Exception:  # pragma: no cover - defensive
+                pass
+            finally:
+                self._external_proc = None
 
     def _ensure_mixer(self) -> bool:
         if not mixer:
             return False
         if not self._mixer_initialized or not mixer.get_init():
             try:
-                mixer.init(frequency=self.SAMPLE_RATE, size=-16, channels=2)  # pragma: no cover - system audio
-                if mixer.get_num_channels() < 4:
-                    mixer.set_num_channels(4)
+                mixer.init()  # pragma: no cover - system audio
                 self._mixer_initialized = True
             except Exception as exc:  # pragma: no cover - platform dependent
                 print(f"Unable to initialise audio playback: {exc}")
