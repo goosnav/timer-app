@@ -1,3 +1,4 @@
 pystray
 Pillow
 simpleaudio
+pygame
